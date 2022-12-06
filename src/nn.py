@@ -5,6 +5,8 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
+LOG_SIG_MAX = 2
+LOG_SIG_MIN = -20
 
 
 class DeepSet(nn.Module):
@@ -134,16 +136,9 @@ class WLinear(nn.Module):
         self,
         in_features: int,
         out_features: int,
-        bias_size: Optional[int] = None,
-        paaa=None,
+        dim: int = 100,
     ):
         super().__init__()
-
-        self.pa = paaa
-        if bias_size is None:
-            bias_size = out_features
-
-        dim = 100
         self.z = nn.Parameter(torch.empty(dim).normal_(0, 1.0 / out_features))
         logger.debug(f"{self.z.mean()}, {self.z.std().item()}")
         self.fc = nn.Linear(dim, in_features * out_features + out_features)
@@ -280,7 +275,6 @@ class MLP(nn.Module):
 
     def adaptation_parameters(self):
         return self.parameters()
-        return self.aparams
 
     def forward(self, x: torch.tensor, acts: Optional[torch.tensor] = None):
         if self._head and acts is not None:
@@ -289,3 +283,29 @@ class MLP(nn.Module):
             return self._final_activation(self.post_seq(h)), self.head_seq(head_input)
         else:
             return self._final_activation(self.seq(x))
+
+
+class TwinValueFunction(nn.Module):
+    def __init__(self, observation_dim: int, action_dim: int = 0, hidden_dim: int = 100, depth: int = 3):
+        super(TwinValueFunction, self).__init__()
+        self.obs_dim = observation_dim
+        self.act_dim = action_dim
+
+        def get_model_layers():
+            layers = [WLinear(observation_dim + action_dim, hidden_dim), nn.ReLU()]
+            for _ in range(0, depth - 2):
+                layers.append(WLinear(hidden_dim, hidden_dim))
+                layers.append(nn.ReLU())
+            layers.append(WLinear(hidden_dim, 1))
+            return layers
+
+        self.f1 = nn.Sequential(*get_model_layers())
+        self.f2 = nn.Sequential(*get_model_layers())
+
+    def forward(self, x):
+        x1 = self.f1(x)
+        x2 = self.f2(x)
+        return x1, x2
+
+    def adaptation_parameters(self):
+        return self.parameters()
