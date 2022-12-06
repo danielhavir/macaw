@@ -48,6 +48,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--normalize_values", action="store_true")
     parser.add_argument("--no_norm", action="store_true")
     parser.add_argument("--no_bootstrap", action="store_true")
+    parser.add_argument("--stochastic_policy", action="store_true")
     parser.add_argument("--q", action="store_true")
     parser.add_argument("--twin", action="store_true")
     parser.add_argument("--debug", action="store_true")

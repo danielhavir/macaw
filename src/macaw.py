@@ -88,6 +88,7 @@ class MACAW(object):
             bias_linear=not args.no_bias_linear,
             extra_head_layers=policy_head,
             w_linear=args.wlinear,
+            deterministic=not args.stochastic_policy,
         ).to(args.device)
 
         if args.cvae:
@@ -380,6 +381,14 @@ class MACAW(object):
                         )
                         mu = mu.squeeze()
                         action_sigma = action_sigma.squeeze().clamp(max=0.5)
+                    elif self._args.stochastic_policy:
+                        mu, action_sigma = policy(
+                            torch.tensor(state, device=self._args.device)
+                            .unsqueeze(0)
+                            .float()
+                        )
+                        mu = mu.squeeze()
+                        action_sigma = action_sigma.squeeze()
                     else:
                         mu = policy(
                             torch.tensor(state, device=self._args.device)
@@ -622,7 +631,11 @@ class MACAW(object):
             action_mu = policy(
                 self.add_task_description(batch[:, : self._observation_dim], task_idx)
             )
-        action_sigma = torch.empty_like(action_mu).fill_(self._action_sigma)
+
+        if self._args.stochastic_policy:
+            action_mu, action_sigma = action_mu
+        else:
+            action_sigma = torch.empty_like(action_mu).fill_(self._action_sigma)
         action_distribution = D.Normal(action_mu, action_sigma)
         action_log_probs = action_distribution.log_prob(
             batch[:, self._observation_dim : self._observation_dim + self._action_dim]
