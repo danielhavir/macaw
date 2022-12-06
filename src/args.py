@@ -49,6 +49,7 @@ def get_args() -> argparse.Namespace:
     parser.add_argument("--no_norm", action="store_true")
     parser.add_argument("--no_bootstrap", action="store_true")
     parser.add_argument("--q", action="store_true")
+    parser.add_argument("--twin", action="store_true")
     parser.add_argument("--debug", action="store_true")
     parser.add_argument("--render_exploration", action="store_true")
     parser.add_argument("--seed", type=int, default=None)

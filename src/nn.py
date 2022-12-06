@@ -302,10 +302,13 @@ class TwinValueFunction(nn.Module):
         self.f1 = nn.Sequential(*get_model_layers())
         self.f2 = nn.Sequential(*get_model_layers())
 
-    def forward(self, x):
+    def forward(self, x, return_min: bool = True):
         x1 = self.f1(x)
         x2 = self.f2(x)
-        return x1, x2
+        if return_min:
+            return torch.minimum(x1, x2)
+        else:
+            return x1, x2
 
     def adaptation_parameters(self):
         return self.parameters()

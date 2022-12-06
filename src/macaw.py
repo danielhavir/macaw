@@ -104,19 +104,29 @@ class MACAW(object):
             for p in self._exploration_policy.parameters():
                 p.data = p.data.clone()
 
-        self._q_function = TwinValueFunction(
-            observation_dim=self._observation_dim + goal_dim,
-            action_dim=self._action_dim,
-            hidden_dim=args.net_width,
-            depth=args.net_depth + 1
-        ).to(args.device)
-        self._value_function = MLP(
-            [self._observation_dim + goal_dim]
-            + [args.net_width] * args.net_depth
-            + [1],
-            bias_linear=not args.no_bias_linear,
-            w_linear=args.wlinear,
-        ).to(args.device)
+        if self._args.q:
+            self._q_function = TwinValueFunction(
+                observation_dim=self._observation_dim + goal_dim,
+                action_dim=self._action_dim,
+                hidden_dim=args.net_width,
+                depth=args.net_depth + 1
+            ).to(args.device)
+
+        if self._args.twin:
+            self._value_function = TwinValueFunction(
+                observation_dim=self._observation_dim + goal_dim,
+                action_dim=0,
+                hidden_dim=args.net_width,
+                depth=args.net_depth + 1
+            ).to(args.device)
+        else:
+            self._value_function = MLP(
+                [self._observation_dim + goal_dim]
+                + [args.net_width] * args.net_depth
+                + [1],
+                bias_linear=not args.no_bias_linear,
+                w_linear=args.wlinear,
+            ).to(args.device)
 
         try:
             logger.info(self._adaptation_policy.seq[0]._linear.weight.mean())
@@ -138,9 +148,10 @@ class MACAW(object):
             ),
             lr=args.outer_policy_lr,
         )
-        self._q_function_optimizer = O.Adam(
-            self._q_function.parameters(), lr=args.outer_value_lr
-        )
+        if self._args.q:
+            self._q_function_optimizer = O.Adam(
+                self._q_function.parameters(), lr=args.outer_value_lr
+            )
         self._value_function_optimizer = O.Adam(
             (
                 self._value_function.parameters()
@@ -172,7 +183,8 @@ class MACAW(object):
             self._adaptation_policy_optimizer.load_state_dict(archive["policy_opt"])
             self._policy_lrs = archive["policy_lrs"]
             self._value_lrs = archive["vf_lrs"]
-            self._q_lrs = archive["q_lrs"]
+            if "q_lrs" in archive:
+                self._q_lrs = archive["q_lrs"]
             if "adv_coef" in archive:
                 self._adv_coef = archive["adv_coef"]
             else:
@@ -279,16 +291,17 @@ class MACAW(object):
                 )
                 for p in self._value_function.adaptation_parameters()
             ]
-            self._q_lrs = [
-                torch.nn.Parameter(
-                    torch.tensor(
-                        float(np.log(self._args.inner_value_lr))
-                        if not self._args.multitask
-                        else 10000.0
-                    ).to(args.device)
-                )
-                for p in self._q_function.adaptation_parameters()
-            ]
+            if self._args.q:
+                self._q_lrs = [
+                    torch.nn.Parameter(
+                        torch.tensor(
+                            float(np.log(self._args.inner_value_lr))
+                            if not self._args.multitask
+                            else 10000.0
+                        ).to(args.device)
+                    )
+                    for p in self._q_function.adaptation_parameters()
+                ]
             if args.advantage_head_coef is not None:
                 self._adv_coef = torch.nn.Parameter(
                     torch.tensor(float(np.log(args.advantage_head_coef))).to(
@@ -298,7 +311,8 @@ class MACAW(object):
 
         self._policy_lr_optimizer = O.Adam(self._policy_lrs, lr=self._args.lrlr)
         self._value_lr_optimizer = O.Adam(self._value_lrs, lr=self._args.lrlr)
-        self._q_lr_optimizer = O.Adam(self._q_lrs, lr=self._args.lrlr)
+        if self._args.q:
+            self._q_lr_optimizer = O.Adam(self._q_lrs, lr=self._args.lrlr)
         if args.advantage_head_coef is not None:
             self._adv_coef_optimizer = O.Adam([self._adv_coef], lr=self._args.lrlr)
 
@@ -461,7 +475,7 @@ class MACAW(object):
             batch[:, self._observation_dim : self._observation_dim + self._action_dim],
         ), -1)
         obs_act_task = self.add_task_description(obs_act, task_idx)
-        qf1, qf2 = q_function(obs_act_task)
+        qf1, qf2 = q_function(obs_act_task, return_min=False)
         with torch.no_grad():
             mc_value_estimates = self.mc_value_estimates_on_batch(
                 value_function,
@@ -489,9 +503,6 @@ class MACAW(object):
         task_idx: Optional[int] = None,
         target=None,
     ) -> dict[str, torch.Tensor]:
-        value_estimates = value_function(
-            self.add_task_description(batch[:, : self._observation_dim], task_idx)
-        )
         with torch.no_grad():
             if target is None:
                 target = value_function
@@ -509,16 +520,31 @@ class MACAW(object):
                 targets[targets < -1] = -targets[targets < -1].abs().log()
                 targets = targets.clone()
 
+        if self._args.twin:
+            vf1, vf2 = value_function(
+                self.add_task_description(batch[:, : self._observation_dim], task_idx),
+                return_min=False
+            )
+            value_estimates = torch.min(vf1, vf2)
+            vf1_loss = nn.functional.mse_loss(vf1, mc_value_estimates)
+            vf2_loss = nn.functional.mse_loss(vf2, mc_value_estimates)
+            value_loss = (vf1_loss + vf2_loss) / 2
+        else:
+            value_estimates = value_function(
+                self.add_task_description(batch[:, : self._observation_dim], task_idx)
+            )
+            if self._args.huber and not inner:
+                losses = F.smooth_l1_loss(value_estimates, targets, reduction="none")
+            else:
+                losses = (value_estimates - targets).pow(2)
+            value_loss = losses.mean()
+
         logger.debug(
             f"({task_idx}) VALUE: {value_estimates.abs().mean()}, {targets.abs().mean()}",
         )
-        if self._args.huber and not inner:
-            losses = F.smooth_l1_loss(value_estimates, targets, reduction="none")
-        else:
-            losses = (value_estimates - targets).pow(2)
 
         return {
-            "value_loss": losses.mean(),
+            "value_loss": value_loss,
             "value_estimates": value_estimates.mean(),
             "mc_mean": mc_value_estimates.mean(),
             "mc_std": mc_value_estimates.std(),
@@ -557,13 +583,13 @@ class MACAW(object):
                 self.add_task_description(batch[:, : self._observation_dim], task_idx)
             )
             if q_function is not None:
-                qf1, qf2 = q_function(
+                action_value_estimates = q_function(
                     torch.cat((
                         batch[:, : self._observation_dim],
                         batch[:, self._observation_dim: self._observation_dim + self._action_dim]
-                    ), -1)
+                    ), -1),
+                    return_min=True
                 )
-                action_value_estimates = torch.minimum(qf1, qf2)
             else:
                 action_value_estimates = self.mc_value_estimates_on_batch(
                     value_function, batch, task_idx
@@ -1644,7 +1670,8 @@ class MACAW(object):
 
         if self._args.lrlr > 0:
             self.update_params(self._value_lr_optimizer)
-            self.update_params(self._q_lr_optimizer)
+            if self._args.q:
+                self.update_params(self._q_lr_optimizer)
             self.update_params(self._policy_lr_optimizer)
             if self._args.advantage_head_coef is not None:
                 self.update_params(self._adv_coef_optimizer)
