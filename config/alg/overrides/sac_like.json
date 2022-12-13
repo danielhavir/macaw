@@ -1,0 +1,8 @@
+{
+    "sac_objective": true,
+    "entropy_alpha_coef": 1.0,
+    "learned_alpha": false,
+    "q": true,
+    "stochastic_policy": true,
+    "name_suffix": "sac_like"
+}
