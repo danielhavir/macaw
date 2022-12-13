@@ -5,8 +5,8 @@ import torch
 import torch.nn as nn
 
 logger = logging.getLogger(__name__)
-LOG_SIG_MAX = 2
-LOG_SIG_MIN = -20
+LOG_VAR_MAX = 2
+LOG_VAR_MIN = -20
 
 
 class DeepSet(nn.Module):
@@ -227,6 +227,7 @@ class MLP(nn.Module):
         bias_linear: bool = False,
         extra_head_layers: List[int] = None,
         w_linear: bool = False,
+        deterministic: bool = True
     ):
         super().__init__()
 
@@ -238,6 +239,10 @@ class MLP(nn.Module):
         self._final_activation = final_activation
         self.seq = nn.Sequential()
         self._head = extra_head_layers is not None
+        self.deterministic = deterministic
+        self.layer_widths = layer_widths
+        if not deterministic:
+            layer_widths[-1] *= 2
 
         if not w_linear:
             linear = BiasLinear if bias_linear else nn.Linear
@@ -252,6 +257,9 @@ class MLP(nn.Module):
             self.seq.add_module(f"fc_{idx}", w)
             if idx < len(layer_widths) - 2:
                 self.seq.add_module(f"relu_{idx}", nn.ReLU())
+
+        if not deterministic:
+            layer_widths[-1] //= 2
 
         if extra_head_layers is not None:
             self.pre_seq = self.seq[:-2]
@@ -280,9 +288,26 @@ class MLP(nn.Module):
         if self._head and acts is not None:
             h = self.pre_seq(x)
             head_input = torch.cat((h, acts), -1)
-            return self._final_activation(self.post_seq(h)), self.head_seq(head_input)
-        else:
+            mu_logvar = self._final_activation(self.post_seq(h))
+            mu_logvar = torch.clamp(mu_logvar, min=LOG_VAR_MIN, max=LOG_VAR_MAX)
+            head_output = self.head_seq(head_input)
+            if self.deterministic:
+                return mu_logvar, head_output
+            else:
+                mu, sigma = (
+                    mu_logvar[:, : mu_logvar.shape[-1] // 2],
+                    (mu_logvar[:, mu_logvar.shape[-1] // 2:] / 2).exp(),
+                )
+                return (mu, sigma), head_output
+        elif self.deterministic:
             return self._final_activation(self.seq(x))
+        else:
+            mu_logvar = self._final_activation(self.seq(x))
+            mu, sigma = (
+                mu_logvar[:, : mu_logvar.shape[-1] // 2],
+                (mu_logvar[:, mu_logvar.shape[-1] // 2:] / 2).exp(),
+            )
+            return mu, sigma
 
 
 class TwinValueFunction(nn.Module):
