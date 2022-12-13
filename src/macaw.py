@@ -8,6 +8,7 @@ import random
 import time
 import warnings
 from collections import defaultdict
+from contextlib import ExitStack
 from copy import deepcopy
 from typing import List, Optional
 
@@ -21,8 +22,8 @@ import torch.optim as O
 
 from torch.utils.tensorboard import SummaryWriter
 
-from src.nn import CVAE, MLP
-from src.utils import Experience, ReplayBuffer, RunningEstimator, setup_logger
+from src.nn import CVAE, MLP, TwinValueFunction
+from src.utils import Experience, ReplayBuffer, RunningEstimator
 
 
 logger = logging.getLogger(__name__)
@@ -103,20 +104,29 @@ class MACAW(object):
             for p in self._exploration_policy.parameters():
                 p.data = p.data.clone()
 
-        self._q_function = MLP(
-            [self._observation_dim + goal_dim + self._action_dim]
-            + [args.net_width] * args.net_depth
-            + [1],
-            bias_linear=not args.no_bias_linear,
-            w_linear=args.wlinear,
-        ).to(args.device)
-        self._value_function = MLP(
-            [self._observation_dim + goal_dim]
-            + [args.net_width] * args.net_depth
-            + [1],
-            bias_linear=not args.no_bias_linear,
-            w_linear=args.wlinear,
-        ).to(args.device)
+        if self._args.q:
+            self._q_function = TwinValueFunction(
+                observation_dim=self._observation_dim + goal_dim,
+                action_dim=self._action_dim,
+                hidden_dim=args.net_width,
+                depth=args.net_depth + 1
+            ).to(args.device)
+
+        if self._args.twin:
+            self._value_function = TwinValueFunction(
+                observation_dim=self._observation_dim + goal_dim,
+                action_dim=0,
+                hidden_dim=args.net_width,
+                depth=args.net_depth + 1
+            ).to(args.device)
+        else:
+            self._value_function = MLP(
+                [self._observation_dim + goal_dim]
+                + [args.net_width] * args.net_depth
+                + [1],
+                bias_linear=not args.no_bias_linear,
+                w_linear=args.wlinear,
+            ).to(args.device)
 
         try:
             logger.info(self._adaptation_policy.seq[0]._linear.weight.mean())
@@ -138,9 +148,10 @@ class MACAW(object):
             ),
             lr=args.outer_policy_lr,
         )
-        self._q_function_optimizer = O.Adam(
-            self._q_function.parameters(), lr=args.outer_value_lr
-        )
+        if self._args.q:
+            self._q_function_optimizer = O.Adam(
+                self._q_function.parameters(), lr=args.outer_value_lr
+            )
         self._value_function_optimizer = O.Adam(
             (
                 self._value_function.parameters()
@@ -172,7 +183,8 @@ class MACAW(object):
             self._adaptation_policy_optimizer.load_state_dict(archive["policy_opt"])
             self._policy_lrs = archive["policy_lrs"]
             self._value_lrs = archive["vf_lrs"]
-            self._q_lrs = archive["q_lrs"]
+            if "q_lrs" in archive:
+                self._q_lrs = archive["q_lrs"]
             if "adv_coef" in archive:
                 self._adv_coef = archive["adv_coef"]
             else:
@@ -279,16 +291,17 @@ class MACAW(object):
                 )
                 for p in self._value_function.adaptation_parameters()
             ]
-            self._q_lrs = [
-                torch.nn.Parameter(
-                    torch.tensor(
-                        float(np.log(self._args.inner_value_lr))
-                        if not self._args.multitask
-                        else 10000.0
-                    ).to(args.device)
-                )
-                for p in self._q_function.adaptation_parameters()
-            ]
+            if self._args.q:
+                self._q_lrs = [
+                    torch.nn.Parameter(
+                        torch.tensor(
+                            float(np.log(self._args.inner_value_lr))
+                            if not self._args.multitask
+                            else 10000.0
+                        ).to(args.device)
+                    )
+                    for p in self._q_function.adaptation_parameters()
+                ]
             if args.advantage_head_coef is not None:
                 self._adv_coef = torch.nn.Parameter(
                     torch.tensor(float(np.log(args.advantage_head_coef))).to(
@@ -298,7 +311,8 @@ class MACAW(object):
 
         self._policy_lr_optimizer = O.Adam(self._policy_lrs, lr=self._args.lrlr)
         self._value_lr_optimizer = O.Adam(self._value_lrs, lr=self._args.lrlr)
-        self._q_lr_optimizer = O.Adam(self._q_lrs, lr=self._args.lrlr)
+        if self._args.q:
+            self._q_lr_optimizer = O.Adam(self._q_lrs, lr=self._args.lrlr)
         if args.advantage_head_coef is not None:
             self._adv_coef_optimizer = O.Adam([self._adv_coef], lr=self._args.lrlr)
 
@@ -455,23 +469,13 @@ class MACAW(object):
         batch,
         inner: bool = False,
         task_idx: Optional[int] = None,
-    ):
-        q_estimates = q_function(
-            self.add_task_description(
-                torch.cat(
-                    (
-                        batch[:, : self._observation_dim],
-                        batch[
-                            :,
-                            self._observation_dim : self._observation_dim
-                            + self._action_dim,
-                        ],
-                    ),
-                    -1,
-                ),
-                task_idx,
-            )
-        )
+    ) -> dict[str, torch.Tensor]:
+        obs_act = torch.cat((
+            batch[:, :self._observation_dim],
+            batch[:, self._observation_dim : self._observation_dim + self._action_dim],
+        ), -1)
+        obs_act_task = self.add_task_description(obs_act, task_idx)
+        qf1, qf2 = q_function(obs_act_task, return_min=False)
         with torch.no_grad():
             mc_value_estimates = self.mc_value_estimates_on_batch(
                 value_function,
@@ -480,7 +484,15 @@ class MACAW(object):
                 self._args.no_bootstrap if inner else False,
             )
 
-        return (q_estimates - mc_value_estimates).pow(2).mean()
+        qf1_loss = nn.functional.mse_loss(qf1, mc_value_estimates)
+        qf2_loss = nn.functional.mse_loss(qf2, mc_value_estimates)
+        qf_loss = (qf1_loss + qf2_loss) / 2
+        return {
+            "q_loss": qf_loss,
+            "q_values": torch.minimum(qf1, qf2).mean(),
+            "mc_mean": mc_value_estimates.mean(),
+            "mc_std": mc_value_estimates.std(),
+        }
 
     # @profile
     def value_function_loss_on_batch(
@@ -490,10 +502,7 @@ class MACAW(object):
         inner: bool = False,
         task_idx: Optional[int] = None,
         target=None,
-    ):
-        value_estimates = value_function(
-            self.add_task_description(batch[:, : self._observation_dim], task_idx)
-        )
+    ) -> dict[str, torch.Tensor]:
         with torch.no_grad():
             if target is None:
                 target = value_function
@@ -511,20 +520,35 @@ class MACAW(object):
                 targets[targets < -1] = -targets[targets < -1].abs().log()
                 targets = targets.clone()
 
+        if self._args.twin:
+            vf1, vf2 = value_function(
+                self.add_task_description(batch[:, : self._observation_dim], task_idx),
+                return_min=False
+            )
+            value_estimates = torch.min(vf1, vf2)
+            vf1_loss = nn.functional.mse_loss(vf1, mc_value_estimates)
+            vf2_loss = nn.functional.mse_loss(vf2, mc_value_estimates)
+            value_loss = (vf1_loss + vf2_loss) / 2
+        else:
+            value_estimates = value_function(
+                self.add_task_description(batch[:, : self._observation_dim], task_idx)
+            )
+            if self._args.huber and not inner:
+                losses = F.smooth_l1_loss(value_estimates, targets, reduction="none")
+            else:
+                losses = (value_estimates - targets).pow(2)
+            value_loss = losses.mean()
+
         logger.debug(
             f"({task_idx}) VALUE: {value_estimates.abs().mean()}, {targets.abs().mean()}",
         )
-        if self._args.huber and not inner:
-            losses = F.smooth_l1_loss(value_estimates, targets, reduction="none")
-        else:
-            losses = (value_estimates - targets).pow(2)
 
-        return (
-            losses.mean(),
-            value_estimates.mean(),
-            mc_value_estimates.mean(),
-            mc_value_estimates.std(),
-        )
+        return {
+            "value_loss": value_loss,
+            "value_estimates": value_estimates.mean(),
+            "mc_mean": mc_value_estimates.mean(),
+            "mc_std": mc_value_estimates.std(),
+        }
 
     def imitation_loss_on_batch(
         self, policy, batch, task_idx: int, inner: bool = False
@@ -553,24 +577,18 @@ class MACAW(object):
         batch,
         task_idx: Optional[int],
         inner: bool = False,
-    ):
+    ) -> dict[str, torch.Tensor]:
         with torch.no_grad():
             value_estimates = value_function(
                 self.add_task_description(batch[:, : self._observation_dim], task_idx)
             )
             if q_function is not None:
                 action_value_estimates = q_function(
-                    torch.cat(
-                        (
-                            batch[:, : self._observation_dim],
-                            batch[
-                                :,
-                                self._observation_dim : self._observation_dim
-                                + self._action_dim,
-                            ],
-                        ),
-                        -1,
-                    )
+                    torch.cat((
+                        batch[:, : self._observation_dim],
+                        batch[:, self._observation_dim: self._observation_dim + self._action_dim]
+                    ), -1),
+                    return_min=True
                 )
             else:
                 action_value_estimates = self.mc_value_estimates_on_batch(
@@ -622,7 +640,11 @@ class MACAW(object):
                 losses = losses + adv_prediction_loss
                 adv_prediction_loss = adv_prediction_loss.mean()
 
-        return losses.mean(), advantages.mean(), weights, adv_prediction_loss
+        return {
+            "policy_loss": losses.mean(),
+            "adv": advantages.mean(),
+            "adv_weights": weights,
+            "adv_loss": adv_prediction_loss}
 
     @staticmethod
     def update_model(
@@ -692,16 +714,18 @@ class MACAW(object):
                 test_buffer.sample(self._args.eval_batch_size), requires_grad=False
             ).to(self._device)
             for step in range(max(log_steps)):
-                vf_loss, _, _, _ = self.value_function_loss_on_batch(
+                loss_dict = self.value_function_loss_on_batch(
                     vf, batch, task_idx=None, inner=True
                 )
+                vf_loss = loss_dict["value_loss"]
                 vf_loss.backward()
                 opt.step()
                 opt.zero_grad()
 
-                ap_loss, _, _, _ = self.adaptation_policy_loss_on_batch(
+                loss_dict = self.adaptation_policy_loss_on_batch(
                     ap, None, vf, batch, task_idx=None, inner=True
                 )
+                ap_loss = loss_dict["policy_loss"]
                 ap_loss.backward()
                 ap_opt.step()
                 ap_opt.zero_grad()
@@ -810,23 +834,51 @@ class MACAW(object):
                     for p in value_function.adaptation_parameters()
                 ]
             )
-            with higher.innerloop_ctx(
-                value_function,
-                opt,
-                override={"lr": [F.softplus(l) for l in self._value_lrs]},
-            ) as (f_value_function, diff_value_opt):
+            with ExitStack() as cm:
+                f_value_function, diff_value_opt = cm.enter_context(higher.innerloop_ctx(
+                    value_function,
+                    opt,
+                    override={"lr": [F.softplus(l) for l in self._value_lrs]},
+                ))
                 if not self._args.imitation:
-                    loss, _, _, _ = self.value_function_loss_on_batch(
+                    loss_dict = self.value_function_loss_on_batch(
                         f_value_function,
                         value_batch,
                         task_idx=test_task_idx,
                         inner=True,
                         target=vf_target,
                     )
+                    loss = loss_dict["value_loss"]
                     diff_value_opt.step(loss)
 
                     # Soft update target value function parameters
                     self.soft_update(f_value_function, vf_target)
+
+                if self._args.q:
+                    q_function = deepcopy(self._q_function)
+                    opt = O.SGD(
+                        [
+                            {"params": p, "lr": None}
+                            for p in q_function.adaptation_parameters()
+                        ]
+                    )
+                    f_q_function, diff_q_opt = cm.enter_context(higher.innerloop_ctx(
+                        q_function,
+                        opt,
+                        override={"lr": [F.softplus(l) for l in self._q_lrs]},
+                    ))
+                    if not self._args.imitation:
+                        loss_dict = self.q_function_loss_on_batch(
+                            f_q_function,
+                            value_function=vf_target,
+                            batch=value_batch,
+                            task_idx=test_task_idx,
+                            inner=True,
+                        )
+                        loss = loss_dict["q_loss"]
+                        diff_q_opt.step(loss)
+                else:
+                    f_q_function = None
 
                 policy = deepcopy(self._adaptation_policy)
                 policy_opt = O.SGD(
@@ -842,14 +894,15 @@ class MACAW(object):
                             f_policy, policy_batch, None, inner=True
                         )
                     else:
-                        loss, _, _, _ = self.adaptation_policy_loss_on_batch(
+                        loss_dict = self.adaptation_policy_loss_on_batch(
                             f_policy,
-                            None,
+                            f_q_function,
                             f_value_function,
                             policy_batch,
                             test_task_idx,
                             inner=True,
                         )
+                        loss = loss_dict["policy_loss"]
                     diff_policy_opt.step(loss)
 
                     adapted_trajectory, adapted_reward, success = self._rollout_policy(
@@ -865,6 +918,16 @@ class MACAW(object):
                     adapted_vf.parameters(), f_value_function.parameters()
                 ):
                     targ.data[:] = src.data[:]
+
+                if self._args.q:
+                    adapted_qf = deepcopy(self._q_function)
+                    for targ, src in zip(
+                            adapted_qf.parameters(), f_q_function.parameters()
+                    ):
+                        targ.data[:] = src.data[:]
+                else:
+                    adapted_qf = None
+
                 adapted_policy = deepcopy(self._adaptation_policy)
                 for targ, src in zip(
                     adapted_policy.parameters(), f_policy.parameters()
@@ -873,10 +936,13 @@ class MACAW(object):
 
                 del f_policy, diff_policy_opt
                 del f_value_function, diff_value_opt
+                if self._args.q:
+                    del f_q_function, diff_q_opt
 
                 if not self._args.imitation and ft != "offline":
-                    vf_target = deepcopy(adapted_vf)
                     ft_v_opt = O.Adam(adapted_vf.parameters(), lr=1e-5)
+                    if self._args.q:
+                        ft_q_opt = O.Adam(adapted_qf.parameters(), lr=1e-5)
                     ft_p_opt = O.Adam(adapted_policy.parameters(), lr=1e-5)
                     buf_size = 50000  # self._env._max_episode_steps * ft_steps
                     replay_buffer = ReplayBuffer.from_dict(buf_size, value_batch_dict)
@@ -950,16 +1016,30 @@ class MACAW(object):
                                         requires_grad=False,
                                     ).to(self._device)
 
-                                    loss, _, _, _ = self.value_function_loss_on_batch(
+                                    loss_dict = self.value_function_loss_on_batch(
                                         adapted_vf,
                                         ft_value_batch,
                                         task_idx=test_task_idx,
                                         inner=True,
                                         target=None,
                                     )
+                                    loss = loss_dict["value_loss"]
                                     loss.backward()
                                     ft_v_opt.step()
                                     ft_v_opt.zero_grad()
+
+                                    if self._args.q:
+                                        loss_dict = self.q_function_loss_on_batch(
+                                            adapted_qf,
+                                            value_function=None,
+                                            batch=ft_value_batch,
+                                            task_idx=test_task_idx,
+                                            inner=True,
+                                        )
+                                        loss = loss_dict["q_loss"]
+                                        loss.backward()
+                                        ft_q_opt.step()
+                                        ft_q_opt.zero_grad()
                                 if ft == "online":
                                     writer.add_scalar(
                                         f"FTStep_Value_Loss/Task_{test_task_idx}",
@@ -983,18 +1063,14 @@ class MACAW(object):
                                             inner=True,
                                         )
                                     else:
-                                        (
-                                            policy_loss,
-                                            _,
-                                            _,
-                                            _,
-                                        ) = self.adaptation_policy_loss_on_batch(
+                                        loss_dict = self.adaptation_policy_loss_on_batch(
                                             adapted_policy,
-                                            None,
+                                            adapted_qf,
                                             adapted_vf,
                                             ft_policy_batch,
                                             test_task_idx,
                                         )
+                                        policy_loss = loss_dict["policy_loss"]
                                     policy_loss.backward()
                                     ft_p_opt.step()
                                     ft_p_opt.zero_grad()
@@ -1117,31 +1193,32 @@ class MACAW(object):
 
             inner_value_losses = []
             meta_value_losses = []
+            inner_q_losses = []
+            meta_q_losses = []
             inner_policy_losses = []
             adv_policy_losses = []
             meta_policy_losses = []
             inner_mc_means, inner_mc_stds = [], []
             outer_mc_means, outer_mc_stds = [], []
             inner_values, outer_values = [], []
+            inner_q_values, outer_q_values = [], []
             inner_weights, outer_weights = [], []
             inner_advantages, outer_advantages = [], []
-
             ##################################################################################################
             # Adapt value function and collect meta-gradients
             ##################################################################################################
             if self._args.multitask:
                 vf_target = self._value_function
-                (
-                    meta_value_function_loss,
-                    value,
-                    mc,
-                    mc_std,
-                ) = self.value_function_loss_on_batch(
+                loss_dict = self.value_function_loss_on_batch(
                     self._value_function,
                     meta_batch,
                     task_idx=train_task_idx,
                     target=vf_target,
                 )
+                meta_value_function_loss = loss_dict["value_loss"]
+                value = loss_dict["value_estimates"]
+                mc = loss_dict["mc_mean"]
+                mc_std = loss_dict["mc_std"]
                 total_vf_loss = meta_value_function_loss / len(
                     self.task_config.train_tasks
                 )
@@ -1152,18 +1229,16 @@ class MACAW(object):
                 outer_mc_stds.append(mc_std.item())
                 meta_value_losses.append(meta_value_function_loss.item())
 
-                (
-                    meta_policy_loss,
-                    outer_adv,
-                    outer_weights_,
-                    _,
-                ) = self.adaptation_policy_loss_on_batch(
+                loss_dict = self.adaptation_policy_loss_on_batch(
                     self._adaptation_policy,
                     None,
                     self._value_function,
                     policy_meta_batch,
                     train_task_idx,
                 )
+                meta_policy_loss = loss_dict["policy_loss"]
+                outer_adv = loss_dict["adv"]
+                outer_weights_ = loss_dict["adv_weights"]
                 (meta_policy_loss / len(self.task_config.train_tasks)).backward()
 
                 outer_weights.append(outer_weights_.mean().item())
@@ -1210,18 +1285,17 @@ class MACAW(object):
                                     value_batch.shape[0] // self._args.maml_steps,
                                     *value_batch.shape[1:],
                                 )[step]
-                                (
-                                    loss,
-                                    value_inner,
-                                    mc_inner,
-                                    mc_std_inner,
-                                ) = self.value_function_loss_on_batch(
+                                loss_dict = self.value_function_loss_on_batch(
                                     f_value_function,
                                     sub_batch,
                                     inner=True,
                                     task_idx=train_task_idx,
                                     target=vf_target,
                                 )
+                                loss = loss_dict["value_loss"]
+                                value_inner = loss_dict["value_estimates"]
+                                mc_inner = loss_dict["mc_mean"]
+                                mc_std_inner = loss_dict["mc_std"]
 
                                 inner_values.append(value_inner.item())
                                 inner_mc_means.append(mc_inner.item())
@@ -1234,17 +1308,17 @@ class MACAW(object):
 
                         # Collect grads for the value function update in the outer loop [L14],
                         #  which is not actually performed here
-                        (
-                            meta_value_function_loss,
-                            value,
-                            mc,
-                            mc_std,
-                        ) = self.value_function_loss_on_batch(
+                        loss_dict = self.value_function_loss_on_batch(
                             f_value_function,
                             meta_batch,
                             task_idx=train_task_idx,
                             target=vf_target,
                         )
+                        meta_value_function_loss = loss_dict["value_loss"]
+                        value = loss_dict["value_estimates"]
+                        mc = loss_dict["mc_mean"]
+                        mc_std = loss_dict["mc_std"]
+
                         total_vf_loss = meta_value_function_loss / len(
                             self.task_config.train_tasks
                         )
@@ -1265,6 +1339,58 @@ class MACAW(object):
                         outer_mc_stds.append(mc_std.item())
                         meta_value_losses.append(meta_value_function_loss.item())
                         ##################################################################################################
+
+                    if self._args.q:
+                        qf = self._q_function
+                        qf.train()
+                        opt = O.SGD(
+                            [{"params": p, "lr": None} for p in qf.adaptation_parameters()]
+                        )
+                        with higher.innerloop_ctx(
+                                qf,
+                                opt,
+                                override={"lr": [F.softplus(l) for l in self._q_lrs]},
+                                copy_initial_weights=False,
+                        ) as (f_q_function, diff_Q_opt):
+                            if len(self._env.tasks) > 1:
+                                for step in range(self._maml_steps):
+                                    logger.debug(
+                                        f"################# VALUE STEP {step} ###################",
+                                    )
+                                    sub_batch = value_batch.view(
+                                        self._args.maml_steps,
+                                        value_batch.shape[0] // self._args.maml_steps,
+                                        *value_batch.shape[1:],
+                                    )[step]
+                                    loss_dict = self.q_function_loss_on_batch(
+                                        q_function=f_q_function,
+                                        batch=sub_batch,
+                                        inner=True,
+                                        task_idx=train_task_idx,
+                                        value_function=vf_target,
+                                    )
+                                    loss = loss_dict["q_loss"]
+                                    diff_Q_opt.step(loss)
+                                    inner_q_losses.append(loss.item())
+                                    inner_q_values.append(loss_dict["q_values"].item())
+
+                            # Collect grads for the value function update in the outer loop [L14],
+                            #  which is not actually performed here
+                            loss_dict = self.q_function_loss_on_batch(
+                                f_q_function,
+                                value_function=vf_target,
+                                batch=meta_batch,
+                                task_idx=train_task_idx,
+                            )
+                            meta_q_function_loss = loss_dict["q_loss"]
+
+                            total_qf_loss = meta_q_function_loss / len(
+                                self.task_config.train_tasks
+                            )
+                            total_qf_loss.backward()
+
+                            outer_q_values.append(loss_dict["q_values"].item())
+                            meta_q_losses.append(meta_q_function_loss.item())
 
                     ##################################################################################################
                     # Adapt policy and collect meta-gradients
@@ -1303,12 +1429,7 @@ class MACAW(object):
                                     inner=True,
                                 )
                             else:
-                                (
-                                    loss,
-                                    adv,
-                                    weights,
-                                    adv_loss,
-                                ) = self.adaptation_policy_loss_on_batch(
+                                loss_dict = self.adaptation_policy_loss_on_batch(
                                     f_adaptation_policy,
                                     adapted_q_function,
                                     adapted_value_function,
@@ -1316,6 +1437,10 @@ class MACAW(object):
                                     train_task_idx,
                                     inner=True,
                                 )
+                                loss = loss_dict["policy_loss"]
+                                adv = loss_dict["adv"]
+                                weights = loss_dict["adv_weights"]
+                                adv_loss = loss_dict["adv_loss"]
                                 if adv_loss is not None:
                                     adv_policy_losses.append(adv_loss.item())
                                 inner_advantages.append(adv.item())
@@ -1329,18 +1454,16 @@ class MACAW(object):
                             f_adaptation_policy, policy_meta_batch, train_task_idx
                         )
                     else:
-                        (
-                            meta_policy_loss,
-                            outer_adv,
-                            outer_weights_,
-                            _,
-                        ) = self.adaptation_policy_loss_on_batch(
+                        loss_dict = self.adaptation_policy_loss_on_batch(
                             f_adaptation_policy,
                             adapted_q_function,
                             adapted_value_function,
                             policy_meta_batch,
                             train_task_idx,
                         )
+                        meta_policy_loss = loss_dict["policy_loss"]
+                        outer_adv = loss_dict["adv"]
+                        outer_weights_ = loss_dict["adv_weights"]
                         outer_weights.append(outer_weights_.mean().item())
                         outer_advantages.append(outer_adv.item())
 
@@ -1402,6 +1525,12 @@ class MACAW(object):
                             np.mean(adv_policy_losses),
                             train_step_idx,
                         )
+                    if self._args.q:
+                        writer.add_scalar(
+                            f"Q_Mean_Inner/Task_{train_task_idx}",
+                            np.mean(inner_q_values),
+                            train_step_idx,
+                        )
                     writer.add_scalar(
                         f"Value_Mean_Inner/Task_{train_task_idx}",
                         np.mean(inner_values),
@@ -1429,6 +1558,12 @@ class MACAW(object):
                     )
                     writer.add_histogram(
                         f"Inner_Weights/Task_{train_task_idx}", weights, train_step_idx
+                    )
+                if self._args.q:
+                    writer.add_scalar(
+                        f"Q_Mean_Outer/Task_{train_task_idx}",
+                        np.mean(outer_q_values),
+                        train_step_idx,
                     )
                 writer.add_scalar(
                     f"Value_Mean_Outer/Task_{train_task_idx}",
@@ -1535,7 +1670,8 @@ class MACAW(object):
 
         if self._args.lrlr > 0:
             self.update_params(self._value_lr_optimizer)
-            self.update_params(self._q_lr_optimizer)
+            if self._args.q:
+                self.update_params(self._q_lr_optimizer)
             self.update_params(self._policy_lr_optimizer)
             if self._args.advantage_head_coef is not None:
                 self.update_params(self._adv_coef_optimizer)
