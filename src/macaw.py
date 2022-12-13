@@ -44,7 +44,7 @@ def check_config(config):
             print('WARNING: TEST AND TRAIN BUFFERS NOT DISJOINT')
     """
     if len(set(config.train_tasks).intersection(set(config.test_tasks))) > 0:
-        print("WARNING: TEST AND TRAIN TASKS NOT DISJOINT")
+        logger.warning("WARNING: TEST AND TRAIN TASKS NOT DISJOINT")
 
 
 class MACAW(object):
@@ -309,6 +309,11 @@ class MACAW(object):
                         args.device
                     )
                 )
+            if args.sac_objective:
+                self._log_alpha_coef = torch.nn.Parameter(
+                    torch.tensor(args.entropy_alpha_coef).to(args.device)
+                )
+                self.target_entropy = -torch.tensor(self._action_dim).to(args.device)
 
         self._policy_lr_optimizer = O.Adam(self._policy_lrs, lr=self._args.lrlr)
         self._value_lr_optimizer = O.Adam(self._value_lrs, lr=self._args.lrlr)
@@ -316,6 +321,8 @@ class MACAW(object):
             self._q_lr_optimizer = O.Adam(self._q_lrs, lr=self._args.lrlr)
         if args.advantage_head_coef is not None:
             self._adv_coef_optimizer = O.Adam([self._adv_coef], lr=self._args.lrlr)
+        if args.learned_alpha:
+            self._alpha_coef_optimizer = O.Adam([self._log_alpha_coef], lr=self._args.lrlr)
 
         self._adaptation_temperature = args.adaptation_temp
         self._device = torch.device(args.device)
@@ -641,9 +648,13 @@ class MACAW(object):
             batch[:, self._observation_dim : self._observation_dim + self._action_dim]
         ).sum(-1)
 
-        losses = -(action_log_probs * weights)
+        if self._args.sac_objective:
+            losses = ((self._log_alpha_coef.detach().exp() * action_log_probs) - action_value_estimates.squeeze(-1))
+        else:
+            losses = -(action_log_probs * weights)
 
         adv_prediction_loss = None
+        alpha_loss = None
         if inner:
             if self._args.advantage_head_coef is not None:
                 adv_prediction_loss = (
@@ -652,12 +663,18 @@ class MACAW(object):
                 )
                 losses = losses + adv_prediction_loss
                 adv_prediction_loss = adv_prediction_loss.mean()
+            if self._args.sac_objective and self._args.learned_alpha:
+                alpha_loss = -(self._log_alpha_coef * (action_log_probs + self.target_entropy).detach())
+                losses = losses + alpha_loss
+                alpha_loss = alpha_loss.mean()
 
         return {
             "policy_loss": losses.mean(),
             "adv": advantages.mean(),
             "adv_weights": weights,
-            "adv_loss": adv_prediction_loss}
+            "adv_loss": adv_prediction_loss,
+            "alpha_loss": alpha_loss
+        }
 
     @staticmethod
     def update_model(
@@ -1210,9 +1227,11 @@ class MACAW(object):
             meta_q_losses = []
             inner_policy_losses = []
             adv_policy_losses = []
+            alpha_policy_losses = []
             meta_policy_losses = []
             inner_mc_means, inner_mc_stds = [], []
             outer_mc_means, outer_mc_stds = [], []
+            alpha_values = []
             inner_values, outer_values = [], []
             inner_q_values, outer_q_values = [], []
             inner_weights, outer_weights = [], []
@@ -1454,8 +1473,12 @@ class MACAW(object):
                                 adv = loss_dict["adv"]
                                 weights = loss_dict["adv_weights"]
                                 adv_loss = loss_dict["adv_loss"]
+                                alpha_loss = loss_dict.get("alpha_loss", None)
                                 if adv_loss is not None:
                                     adv_policy_losses.append(adv_loss.item())
+                                if alpha_loss is not None:
+                                    alpha_policy_losses.append(alpha_loss.item())
+                                    alpha_values.append(self._log_alpha_coef.detach().exp().item())
                                 inner_advantages.append(adv.item())
                                 inner_weights.append(weights.mean().item())
 
@@ -1542,6 +1565,17 @@ class MACAW(object):
                         writer.add_scalar(
                             f"Q_Mean_Inner/Task_{train_task_idx}",
                             np.mean(inner_q_values),
+                            train_step_idx,
+                        )
+                    if len(alpha_policy_losses):
+                        writer.add_scalar(
+                            f"Loss_Policy_Alpha_Inner/Task_{train_task_idx}",
+                            np.mean(alpha_policy_losses),
+                            train_step_idx,
+                        )
+                        writer.add_scalar(
+                            f"Value_Mean_Alpha/Task_{train_task_idx}",
+                            np.mean(alpha_values),
                             train_step_idx,
                         )
                     writer.add_scalar(
@@ -1688,6 +1722,8 @@ class MACAW(object):
             self.update_params(self._policy_lr_optimizer)
             if self._args.advantage_head_coef is not None:
                 self.update_params(self._adv_coef_optimizer)
+            if self._args.learned_alpha:
+                self.update_params(self._alpha_coef_optimizer)
 
         return (
             rollouts,

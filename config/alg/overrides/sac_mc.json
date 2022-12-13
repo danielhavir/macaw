@@ -1,0 +1,6 @@
+{
+    "sac_objective": true,
+    "entropy_alpha_coef": 1.0,
+    "learned_alpha": false,
+    "name_suffix": "sac_mc"
+}
